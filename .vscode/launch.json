@@ -19,5 +19,12 @@
             "args": ["-c", "configs/ljs_base.json", "-m", "ljs_base"],
             "console": "integratedTerminal",
         },
+        {
+            "name": "infer",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "infer.py",
+            "console": "integratedTerminal",
+        },
     ]
 }

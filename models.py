@@ -168,7 +168,7 @@ class TextEncoder(nn.Module):
     x = self.emb(x) * math.sqrt(self.hidden_channels) # [b, t, h]
     x = torch.transpose(x, 1, -1) # [b, h, t]
     x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
-
+    # Transformer
     x = self.encoder(x * x_mask, x_mask)
     stats = self.proj(x) * x_mask
 
@@ -233,11 +233,11 @@ class PosteriorEncoder(nn.Module):
 
   def forward(self, x, x_lengths, g=None):
     x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
-    x = self.pre(x) * x_mask
-    x = self.enc(x, x_mask, g=g)
-    stats = self.proj(x) * x_mask
+    x = self.pre(x) * x_mask # 线性层
+    x = self.enc(x, x_mask, g=g) # WaveNet
+    stats = self.proj(x) * x_mask # 线性层
     m, logs = torch.split(stats, self.out_channels, dim=1)
-    z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
+    z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask # ? 这是个什么鸟玩意
     return z, m, logs, x_mask
 
 
@@ -456,19 +456,23 @@ class SynthesizerTrn(nn.Module):
     if n_speakers > 1:
       self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
-  def forward(self, x, x_lengths, y, y_lengths, sid=None):
-
-    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
-    if self.n_speakers > 0:
+  def forward(self, x, x_lengths, y, y_lengths, sid=None): # x是token，y是谱图
+    ##################### 音频分布用q表示，文本分布用p表示 #####################
+    # token转embedding送入Transformer+线性层
+    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths) # x是htext m_p是均值 logs_p是log(标准差)
+    if self.n_speakers > 0: # 这是个什么鸟玩意
       g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
     else:
       g = None
-
-    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+    # 谱图送入后验编码器，线性层+WaveNet+线性层+一个什么鸟变换 z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
+    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g) # m_q是均值 logs_q是log(标准差) z是根据均值方差采样得到的z
+    # 这个flow跟后验编码器有点像，不过最后那个变换是      x1 = m + x1 * torch.exp(logs) * x_mask; x = torch.cat([x0, x1], 1); logdet = torch.sum(logs, [1,2])
+    # 经过flow之后，把q分布转换为了p分布
     z_p = self.flow(z, y_mask, g=g)
 
     with torch.no_grad():
-      # negative cross-entropy
+      # 计算log(1/sqrt(2π*σ)*exp(-(x-m)^2/(2σ^2))) 
+      # docs/logfx.png
       s_p_sq_r = torch.exp(-2 * logs_p) # [b, d, t]
       neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True) # [b, 1, t_s]
       neg_cent2 = torch.matmul(-0.5 * (z_p ** 2).transpose(1, 2), s_p_sq_r) # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
@@ -479,9 +483,9 @@ class SynthesizerTrn(nn.Module):
       attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
       attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
 
-    w = attn.sum(2)
-    if self.use_sdp:
-      l_length = self.dp(x, x_mask, w, g=g)
+    w = attn.sum(2) # 总的语音时长
+    if self.use_sdp: # 使用随机持续时间预测器
+      l_length = self.dp(x, x_mask, w, g=g) # l_length是损失
       l_length = l_length / torch.sum(x_mask)
     else:
       logw_ = torch.log(w + 1e-6) * x_mask
@@ -489,7 +493,7 @@ class SynthesizerTrn(nn.Module):
       l_length = torch.sum((logw - logw_)**2, [1,2]) / torch.sum(x_mask) # for averaging 
 
     # expand prior
-    m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
+    m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2) # 按照每个token的持续时长进行复制，有点像tile 这么一来m_p和z_p就同形了
     logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
 
     z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
